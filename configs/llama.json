@@ -31,7 +31,7 @@
   "data": {
     "dataset_id": "jordanpainter/dialect-grpo-base-llama",
     "dataset_split": "train",
-    "base_output_column": "base_output_llama",
+    "base_output_column": "base_output_llama_sft",
     "seed": 42,
     "test_size": 0.02,
     "system_prompt": "You are a helpful assistant."
