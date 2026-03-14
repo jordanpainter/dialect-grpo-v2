@@ -693,7 +693,7 @@ def main() -> None:
     max_completion_len = int(cfg.get("trainer", {}).get("max_completion_length", 64))
     safety_margin = int(cfg.get("trainer", {}).get("length_safety_margin", 8))
 
-    max_prompt_len = model_max_len - max_completion_len - safety_margin
+    max_prompt_len = 2048
     max_prompt_len = max(32, int(max_prompt_len))
 
     logger.info(
