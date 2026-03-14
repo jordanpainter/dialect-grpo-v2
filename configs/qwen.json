@@ -1,9 +1,10 @@
 {
   "wandb": {
     "project": "dialect-grpo-v2",
-    "entity": "jordanpainter"
+    "entity": "jordanpainter",
+     "api_key": "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"
   },
-  
+
   "model": {
     "model_id": "srirag/sft-qwen-all",
     "tokenizer_id": "Qwen/Qwen3-8B",
