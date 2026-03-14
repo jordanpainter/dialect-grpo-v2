@@ -458,7 +458,11 @@ class CombinedReward:
         r_d_chosen = np.array(dialect_density(list(chosen)), dtype=np.float32)
         r_d_gain = r_d_gen - r_d_base
 
-        r_c = self.comet.score(prompt_raw, completions, chosen)
+
+        if self.w_comet != 0.0:
+            r_c = self.comet.score(prompt_raw, completions, chosen)
+        else:
+            r_c = np.zeros(len(completions), dtype=np.float32)
         r_s = self.cosine.score(completions, chosen)
 
         # Normalize each component
