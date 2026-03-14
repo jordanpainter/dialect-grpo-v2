@@ -1,4 +1,3 @@
-# rewards/dialect_reward.py
 from __future__ import annotations
 
 import os
@@ -6,10 +5,9 @@ from typing import List, Optional
 
 import torch
 
-from .dialect_reward_model import RewardModel
+from .dialect_reward_model import DialectDensityScorer
 
-# Lazy singleton so we only load weights once per process
-_RM: Optional[RewardModel] = None
+_SCORER: Optional[DialectDensityScorer] = None
 
 
 def _get_local_rank() -> int:
@@ -24,27 +22,64 @@ def _default_device() -> str:
     return "cpu"
 
 
-def _get_rm() -> RewardModel:
-    global _RM
-    if _RM is None:
+def _get_scorer() -> DialectDensityScorer:
+    global _SCORER
+    if _SCORER is None:
         model_path = os.environ.get("DIALECT_REWARD_MODEL", "srirag/feature-identifier")
-        device = os.environ.get("DIALECT_REWARD_DEVICE", None)  # override if set
+        device = os.environ.get("DIALECT_REWARD_DEVICE")
         if device is None:
             device = _default_device()
-        _RM = RewardModel(model_path=model_path, device=device)
-    return _RM
+
+        max_length = int(os.environ.get("DIALECT_REWARD_MAX_LENGTH", "256"))
+        _SCORER = DialectDensityScorer(
+            model_path=model_path,
+            device=device,
+            max_length=max_length,
+        )
+    return _SCORER
 
 
-def dialect_reward(prompts: List[str], completions: List[str], **kwargs) -> List[float]:
+def dialect_density(texts: List[str]) -> List[float]:
     """
-    GRPO reward function: takes prompts + completions, returns a scalar reward per completion.
-    Uses the dialect feature identifier model.
+    Returns dialect density in [0, 1] for each text.
     """
-    rm = _get_rm()
+    scorer = _get_scorer()
+    densities = scorer.score_density(texts)
 
-    # The reward model expects a list of texts; we only score completions here
-    rewards_t = rm.reward(completions)
-    if isinstance(rewards_t, torch.Tensor):
-        rewards_t = rewards_t.detach().cpu()
-        return [float(x) for x in rewards_t.tolist()]
-    return [float(x) for x in rewards_t]
+    if isinstance(densities, torch.Tensor):
+        densities = densities.detach().cpu().tolist()
+
+    return [float(x) for x in densities]
+
+
+def dialect_raw_score(texts: List[str]) -> List[float]:
+    """
+    Returns raw expected feature count for each text.
+    """
+    scorer = _get_scorer()
+    raw = scorer.score_raw(texts)
+
+    if isinstance(raw, torch.Tensor):
+        raw = raw.detach().cpu().tolist()
+
+    return [float(x) for x in raw]
+
+
+def dialect_density_gain(generated_texts: List[str], base_texts: List[str]) -> List[float]:
+    """
+    Returns density(generation) - density(base) for each paired example.
+    """
+    if len(generated_texts) != len(base_texts):
+        raise ValueError(
+            f"generated_texts and base_texts must have the same length, got "
+            f"{len(generated_texts)} and {len(base_texts)}"
+        )
+
+    scorer = _get_scorer()
+    details = scorer.compare_density(generated_texts, base_texts)
+    gain = details["gain"]
+
+    if isinstance(gain, torch.Tensor):
+        gain = gain.detach().cpu().tolist()
+
+    return [float(x) for x in gain]

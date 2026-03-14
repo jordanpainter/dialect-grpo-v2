@@ -1,115 +1,125 @@
+from __future__ import annotations
+
+from typing import Dict, List, Optional
+
 import torch
-import torch.nn.functional as F
 from transformers import AutoTokenizer
+
 from .dialect_feature_model import MultiheadDialectFeatureModel
 
-class RewardModel:
-    """
-    Loads a trained multi-head dialect feature classifier and
-    exposes an RL-ready scalar reward function.
 
-    Reward = log(1 + sum(sigmoid(logits)))
-    Optionally apply a length penalty or normalisation.
+class DialectDensityScorer:
+    """
+    Loads the trained dialect feature classifier and exposes reusable scoring methods.
+
+    For each text, we compute:
+    - logits for each dialect feature
+    - probabilities via sigmoid
+    - raw_score = sum(feature probabilities)
+    - density = raw_score / num_features
+
+    density is in [0, 1] and is the cleanest quantity to compare between:
+    - generation
+    - base output
     """
 
     def __init__(
         self,
         model_path: str,
-        device: str = "cuda" if torch.cuda.is_available() else "cpu",
-        length_penalty_alpha: float = 0.0,
+        device: Optional[str] = None,
+        max_length: int = 256,
     ):
-        self.device = torch.device(device) if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        # load tokenizer
+        self.device = torch.device(device)
+        self.max_length = int(max_length)
+
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
-
-        # load model
         self.model = MultiheadDialectFeatureModel.from_pretrained(model_path)
         self.model.to(self.device)
         self.model.eval()
 
-        # number of features (for potential normalisation)
-        self.num_features = self.model.num_features
+        self.num_features = int(self.model.num_features)
 
-    @torch.no_grad()
-    def predict_raw_scores(self, texts: list[str], max_length: int = 256):
-        """
-        Returns raw sum of probabilities per text, and lengths.
-        """
+    def to(self, device: str) -> "DialectDensityScorer":
+        self.device = torch.device(device)
+        self.model.to(self.device)
+        return self
 
-        # tokenizer collates batch
-        inputs = self.tokenizer(
+    def _tokenize(self, texts: List[str]) -> Dict[str, torch.Tensor]:
+        return self.tokenizer(
             texts,
             padding=True,
             truncation=True,
             return_tensors="pt",
-            max_length=max_length,
+            max_length=self.max_length,
         ).to(self.device)
 
+    @torch.no_grad()
+    def predict_logits(self, texts: List[str]) -> torch.Tensor:
+        inputs = self._tokenize(texts)
         outputs = self.model(
             input_ids=inputs["input_ids"],
             attention_mask=inputs["attention_mask"],
         )
+        return outputs.logits.detach()
 
-        logits = outputs.logits
-        probs = torch.sigmoid(logits)
+    @torch.no_grad()
+    def predict_feature_probabilities(self, texts: List[str]) -> torch.Tensor:
+        logits = self.predict_logits(texts)
+        return torch.sigmoid(logits)
 
-        # sum of probabilities
+    @torch.no_grad()
+    def score_raw(self, texts: List[str]) -> torch.Tensor:
+        """
+        Returns the expected number of active dialect features per text.
+        Shape: (batch,)
+        """
+        probs = self.predict_feature_probabilities(texts)
+        return probs.sum(dim=1)
+
+    @torch.no_grad()
+    def score_density(self, texts: List[str]) -> torch.Tensor:
+        """
+        Returns dialect density per text in [0, 1].
+        Shape: (batch,)
+        """
+        raw = self.score_raw(texts)
+        return raw / float(self.num_features)
+
+    @torch.no_grad()
+    def score_details(self, texts: List[str]) -> Dict[str, torch.Tensor]:
+        """
+        Convenience method for debugging or analysis.
+        Returns:
+        - feature_probs: (batch, num_features)
+        - raw: (batch,)
+        - density: (batch,)
+        """
+        probs = self.predict_feature_probabilities(texts)
         raw = probs.sum(dim=1)
-
-        # number of tokens in text (for length penalty)
-        lengths = inputs["attention_mask"].sum(dim=1).float()
-
-        return raw.cpu(), lengths.cpu()
-
-    @torch.no_grad()
-    def reward(
-        self,
-        texts: list[str],
-        max_length: int = 256,
-        normalise: bool = False,
-    ) -> torch.Tensor:
-        """
-        Returns scalar reward for a batch of texts.
-
-        Reward = log1p(raw_sum)
-        with optional length penalty and rate normalisation.
-        """
-
-        raw, lengths = self.predict_raw_scores(texts, max_length=max_length)
-
-        # apply normalisation if requested
-        if normalise:
-            raw = raw / self.num_features
-
-        # log1p compression
-        reward = torch.log1p(raw)
-
-        return reward
+        density = raw / float(self.num_features)
+        return {
+            "feature_probs": probs.detach().cpu(),
+            "raw": raw.detach().cpu(),
+            "density": density.detach().cpu(),
+        }
 
     @torch.no_grad()
-    def margin(
-        self,
-        chosen: list[str],
-        rejected: list[str],
-        **kwargs,
-    ) -> torch.Tensor:
+    def compare_density(self, generated_texts: List[str], base_texts: List[str]) -> Dict[str, torch.Tensor]:
         """
-        Computes margin reward for a batch of (chosen, rejected) pairs.
-
-        Useful for ranking-based RL objectives.
+        Returns:
+        - gen_density
+        - base_density
+        - gain = gen_density - base_density
         """
+        gen_density = self.score_density(generated_texts)
+        base_density = self.score_density(base_texts)
+        gain = gen_density - base_density
 
-        # compute raw reward on both sets
-        r_chosen = self.reward(chosen, **kwargs)
-        r_rejected = self.reward(rejected, **kwargs)
-
-        return r_chosen - r_rejected
-
-    def to(self, device: str):
-        """
-        Moves model & tokenizer to a different device if needed.
-        """
-        self.device = device
-        self.model.to(device)
-        return self
+        return {
+            "gen_density": gen_density.detach().cpu(),
+            "base_density": base_density.detach().cpu(),
+            "gain": gain.detach().cpu(),
+        }

@@ -9,17 +9,15 @@ from transformers.modeling_outputs import SequenceClassifierOutput
 
 class MultiheadDialectFeatureModel(BertPreTrainedModel):
     """
-    Vectorised multi-label multitask classifier.
+    Multi-label dialect feature classifier.
 
-    Backbone: BERT
-    Representation: CLS token embedding (not pooler_output)
-    Shared head: MLP feature extractor
-    Output: single linear layer -> num_features logits
-    Optional: per-feature temperature scaling (logits / T)
-    Loss: BCEWithLogitsLoss with optional pos_weight
+    - Backbone: BERT
+    - Representation: CLS token embedding
+    - Output: num_features logits, one per dialect feature
+    - Loss: BCEWithLogitsLoss for multi-label classification
     """
 
-    def __init__(self, config, num_features=135, pos_weight=None):
+    def __init__(self, config, num_features: int = 135, pos_weight=None):
         super().__init__(config)
 
         self.num_features = num_features
@@ -47,8 +45,7 @@ class MultiheadDialectFeatureModel(BertPreTrainedModel):
         self.use_temperature_scaling = False
 
         self.register_buffer("pos_weight", pos_weight)
-
-        self.post_init()   # IMPORTANT
+        self.post_init()
 
     def forward(
         self,
@@ -77,20 +74,17 @@ class MultiheadDialectFeatureModel(BertPreTrainedModel):
             return_dict=return_dict,
         )
 
-        # Use CLS token embedding, not pooler_output
-        cls = outputs.last_hidden_state[:, 0]  # (batch, hidden)
+        cls = outputs.last_hidden_state[:, 0]
         cls = self.dropout(cls)
 
-        shared = self.feature_extractor(cls)   # (batch, proj)
-        logits = self.classifier(shared)       # (batch, num_features)
+        shared = self.feature_extractor(cls)
+        logits = self.classifier(shared)
 
         if self.use_temperature_scaling:
-            # Broadcast divide: (batch, num_features) / (num_features,)
             logits = logits / self.temperature_scales.clamp(min=1e-6)
 
         loss = None
         if labels is not None:
-            # BCEWithLogits expects float labels with same shape as logits
             labels = labels.float()
             loss_fct = nn.BCEWithLogitsLoss(pos_weight=self.pos_weight)
             loss = loss_fct(logits, labels)
@@ -111,8 +105,7 @@ class MultiheadDialectFeatureModel(BertPreTrainedModel):
     @torch.no_grad()
     def calibrate_temperature(self, dataloader, device="cpu", t_min=0.5, t_max=3.0, steps=50, n_bins=10):
         """
-        Calibrate per-feature temperatures via simple grid search minimising ECE.
-        Note: This is O(num_features * steps) and can be slow for large datasets.
+        Calibrate per-feature temperatures via simple grid search minimizing ECE.
         """
         self.eval()
         self.to(device)
@@ -125,7 +118,6 @@ class MultiheadDialectFeatureModel(BertPreTrainedModel):
             att = batch["attention_mask"].to(device)
             labs = batch["labels"].to(device).float()
 
-            # Forward without temperature
             out = self.encoder(input_ids=ids, attention_mask=att, return_dict=True)
             cls = out.last_hidden_state[:, 0]
             cls = self.dropout(cls)
@@ -135,12 +127,11 @@ class MultiheadDialectFeatureModel(BertPreTrainedModel):
             all_logits.append(logits.detach().cpu())
             all_labels.append(labs.detach().cpu())
 
-        all_logits = torch.cat(all_logits, dim=0)  # (N, F)
-        all_labels = torch.cat(all_labels, dim=0)  # (N, F)
+        all_logits = torch.cat(all_logits, dim=0)
+        all_labels = torch.cat(all_labels, dim=0)
 
         temps = torch.linspace(t_min, t_max, steps)
 
-        # Calibrate each feature independently
         for i in range(self.num_features):
             best_temp = 1.0
             best_ece = float("inf")
@@ -162,7 +153,6 @@ class MultiheadDialectFeatureModel(BertPreTrainedModel):
         print(f"[Temperature calibrated] avg temp = {avg_t:.2f}")
 
     def _calculate_ece(self, probs, labels, n_bins=10):
-        # probs: (N,), labels: (N,)
         bin_boundaries = torch.linspace(0, 1, n_bins + 1)
         ece = 0.0
 

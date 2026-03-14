@@ -1,18 +1,19 @@
 """
 src/grpo.py
 
-GRPO training script for dialectal English preference learning.
+GRPO training script for dialectal English preference learning (v2).
 
-Main improvements in this version:
-- Loads COMET once and reuses it across training.
-- Loads SentenceTransformer once and reuses it across training.
-- Logs individual raw and normalized reward components.
-- Surfaces KL-like metrics if TRL provides them in trainer logs.
-- Sets float32 matmul precision for Tensor Core GPUs.
+Main changes in this version:
+- Supports loading datasets either from local disk or Hugging Face Hub.
+- Uses dialect density gain as the dialect reward term:
+      dialect_gain = dialect_density(generation) - dialect_density(base_output)
+- Keeps semantic reward against the chosen response using COMET + cosine similarity.
+- Logs generation/base/chosen dialect densities and gain to trainer logs (and therefore W&B).
+- Surfaces KL-like metrics under stable names when TRL provides them.
 - Keeps hard prompt length guard and chat prompt formatting.
 
 Run:
-  accelerate launch --num_processes=1 -m src.grpo -c configs/qwen.json
+  accelerate launch --num_processes=1 -m src.grpo -c configs/qwen_v2.json
 """
 
 from __future__ import annotations
@@ -41,7 +42,8 @@ from comet import download_model as comet_download_model
 from comet import load_from_checkpoint as comet_load_from_checkpoint
 
 # --- Reward components (project modules) ---
-from rewards.dialect_reward import dialect_reward
+# Assumes your refactor now exposes dialect_density(texts: List[str]) -> List[float]
+from rewards.dialect_reward import dialect_density
 
 # --- Prompt formatting fallback (project module) ---
 from src.formatting import build_chat_prompt
@@ -193,11 +195,20 @@ def load_policy_and_tokenizer(cfg: Dict[str, Any], logger: logging.Logger) -> Tu
 # Dataset loading and prompt formatting
 # =============================================================================
 
-def load_dataset_from_hub_snapshot(dataset_id: str, split: str, logger: logging.Logger):
-    local_path = snapshot_download(dataset_id, repo_type="dataset")
-    logger.info("Downloaded dataset snapshot to: %s", local_path)
+def load_dataset(cfg_data: Dict[str, Any], logger: logging.Logger):
+    dataset_path = cfg_data.get("dataset_path")
+    dataset_id = cfg_data.get("dataset_id")
+    split = cfg_data.get("dataset_split", "train")
 
-    ds_any = load_from_disk(local_path)
+    if dataset_path:
+        logger.info("Loading dataset from local disk: %s", dataset_path)
+        ds_any = load_from_disk(dataset_path)
+    elif dataset_id:
+        local_path = snapshot_download(dataset_id, repo_type="dataset")
+        logger.info("Downloaded dataset snapshot to: %s", local_path)
+        ds_any = load_from_disk(local_path)
+    else:
+        raise ValueError("Expected either data.dataset_path or data.dataset_id in config.")
 
     if hasattr(ds_any, "column_names"):
         logger.info("Loaded dataset (Dataset) with columns: %s", ds_any.column_names)
@@ -269,8 +280,18 @@ class CachedCosineScorer:
         self._ensure_loaded()
         assert self.model is not None
 
-        emb_c = self.model.encode(list(completions), convert_to_tensor=True, normalize_embeddings=True, show_progress_bar=False)
-        emb_r = self.model.encode(list(chosen), convert_to_tensor=True, normalize_embeddings=True, show_progress_bar=False)
+        emb_c = self.model.encode(
+            list(completions),
+            convert_to_tensor=True,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        )
+        emb_r = self.model.encode(
+            list(chosen),
+            convert_to_tensor=True,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        )
         sims = torch.sum(emb_c * emb_r, dim=-1)
         return sims.detach().cpu().float().numpy()
 
@@ -290,7 +311,6 @@ class CachedCometScorer:
             ckpt_path = comet_download_model(self.model_name)
             self.model = comet_load_from_checkpoint(ckpt_path)
 
-            # Move once if possible
             if hasattr(self.model, "to"):
                 self.model = self.model.to(self.device)
 
@@ -303,7 +323,6 @@ class CachedCometScorer:
 
         data = [{"src": p, "mt": c, "ref": r} for p, c, r in zip(prompts, completions, chosen)]
 
-        # COMET API returns (scores, system_score) in current common versions
         if self.device == "cuda":
             out = self.model.predict(
                 data,
@@ -333,20 +352,31 @@ class CachedCometScorer:
 
 @dataclass
 class RewardTelemetry:
-    raw_dialect_mean: float = 0.0
+    raw_dialect_gen_mean: float = 0.0
+    raw_dialect_base_mean: float = 0.0
+    raw_dialect_chosen_mean: float = 0.0
+    raw_dialect_gain_mean: float = 0.0
     raw_comet_mean: float = 0.0
     raw_cosine_mean: float = 0.0
-    norm_dialect_mean: float = 0.0
+
+    norm_dialect_gain_mean: float = 0.0
     norm_comet_mean: float = 0.0
     norm_cosine_mean: float = 0.0
+
     total_mean: float = 0.0
     total_std: float = 0.0
+
+    preview_logged: bool = False
 
 
 def make_trim_wrapper(stop_strings: Sequence[str]):
     def trim_wrapper(reward_fn):
         def _wrapped(prompts, completions, **kwargs):
             trimmed = [hard_trim_completion(c, stop_strings) for c in completions]
+            kwargs = dict(kwargs)
+            base_col = kwargs.get("base_output_column_name", "base_output_qwen")
+            if base_col in kwargs and kwargs[base_col] is not None:
+                kwargs[base_col] = [hard_trim_completion(c, stop_strings) for c in kwargs[base_col]]
             return reward_fn(prompts, trimmed, **kwargs)
         _wrapped.__name__ = getattr(reward_fn, "__name__", "reward_fn")
         return _wrapped
@@ -371,6 +401,8 @@ class CombinedReward:
         self.beta = float(ncfg.get("beta", 0.99))
         self.warmup_steps = int(ncfg.get("warmup_steps", 0))
 
+        self.verbose_examples = int(rcfg.get("verbose_examples", 0))
+
         self.rz_dialect = RunningZScore(beta=self.beta, eps=self.eps)
         self.rz_comet = RunningZScore(beta=self.beta, eps=self.eps)
         self.rz_cosine = RunningZScore(beta=self.beta, eps=self.eps)
@@ -386,8 +418,10 @@ class CombinedReward:
             logger=logger,
         )
 
+        self.base_output_column_name = str(cfg.get("data", {}).get("base_output_column", "base_output_qwen"))
         self.latest = RewardTelemetry()
         self._logged_keys = False
+        self._preview_done = False
 
     def _zscore_batch(self, x: np.ndarray) -> np.ndarray:
         mu = x.mean()
@@ -405,30 +439,48 @@ class CombinedReward:
             raise ValueError("Expected 'chosen' in kwargs for COMET/cosine rewards.")
 
         prompt_raw = kw.get("prompt_raw", prompts)
+        base_outputs = kw.get(self.base_output_column_name)
 
-        r_d = np.array(dialect_reward(prompts, completions), dtype=np.float32)
+        if base_outputs is None:
+            raise ValueError(
+                f"Expected '{self.base_output_column_name}' in reward kwargs for dialect-gain reward."
+            )
+
+        if len(base_outputs) != len(completions):
+            raise ValueError(
+                f"Length mismatch between completions ({len(completions)}) "
+                f"and base outputs ({len(base_outputs)})."
+            )
+
+        # Raw reward components
+        r_d_gen = np.array(dialect_density(list(completions)), dtype=np.float32)
+        r_d_base = np.array(dialect_density(list(base_outputs)), dtype=np.float32)
+        r_d_chosen = np.array(dialect_density(list(chosen)), dtype=np.float32)
+        r_d_gain = r_d_gen - r_d_base
+
         r_c = self.comet.score(prompt_raw, completions, chosen)
         r_s = self.cosine.score(completions, chosen)
 
+        # Normalize each component
         if self.method == "none":
-            z_d, z_c, z_s = r_d, r_c, r_s
+            z_d, z_c, z_s = r_d_gain, r_c, r_s
 
         elif self.method == "batch_zscore":
-            z_d = self._clip(self._zscore_batch(r_d))
+            z_d = self._clip(self._zscore_batch(r_d_gain))
             z_c = self._clip(self._zscore_batch(r_c))
             z_s = self._clip(self._zscore_batch(r_s))
 
         elif self.method == "running_zscore":
-            self.rz_dialect.update(r_d)
+            self.rz_dialect.update(r_d_gain)
             self.rz_comet.update(r_c)
             self.rz_cosine.update(r_s)
 
             if self.rz_dialect.steps <= self.warmup_steps:
-                z_d = self._clip(self._zscore_batch(r_d))
+                z_d = self._clip(self._zscore_batch(r_d_gain))
                 z_c = self._clip(self._zscore_batch(r_c))
                 z_s = self._clip(self._zscore_batch(r_s))
             else:
-                z_d = self._clip(self.rz_dialect.normalize(r_d))
+                z_d = self._clip(self.rz_dialect.normalize(r_d_gain))
                 z_c = self._clip(self.rz_comet.normalize(r_c))
                 z_s = self._clip(self.rz_cosine.normalize(r_s))
         else:
@@ -437,23 +489,55 @@ class CombinedReward:
         total = (self.w_dialect * z_d) + (self.w_comet * z_c) + (self.w_cosine * z_s)
 
         self.latest = RewardTelemetry(
-            raw_dialect_mean=float(r_d.mean()),
+            raw_dialect_gen_mean=float(r_d_gen.mean()),
+            raw_dialect_base_mean=float(r_d_base.mean()),
+            raw_dialect_chosen_mean=float(r_d_chosen.mean()),
+            raw_dialect_gain_mean=float(r_d_gain.mean()),
             raw_comet_mean=float(r_c.mean()),
             raw_cosine_mean=float(r_s.mean()),
-            norm_dialect_mean=float(z_d.mean()),
+            norm_dialect_gain_mean=float(z_d.mean()),
             norm_comet_mean=float(z_c.mean()),
             norm_cosine_mean=float(z_s.mean()),
             total_mean=float(total.mean()),
             total_std=float(total.std()),
+            preview_logged=self._preview_done,
         )
 
         if not self._logged_keys:
             self.logger.info("combined_reward kwargs keys: %s", sorted(list(kw.keys())))
             self._logged_keys = True
 
+        if self.verbose_examples > 0 and not self._preview_done:
+            n = min(self.verbose_examples, len(completions))
+            for i in range(n):
+                self.logger.info(
+                    (
+                        "reward preview %d | "
+                        "gen_density=%.4f base_density=%.4f chosen_density=%.4f gain=%.4f "
+                        "comet=%.4f cosine=%.4f | "
+                        "base=%r | response=%r"
+                    ),
+                    i,
+                    float(r_d_gen[i]),
+                    float(r_d_base[i]),
+                    float(r_d_chosen[i]),
+                    float(r_d_gain[i]),
+                    float(r_c[i]),
+                    float(r_s[i]),
+                    base_outputs[i][:300] if isinstance(base_outputs[i], str) else base_outputs[i],
+                    completions[i][:300] if isinstance(completions[i], str) else completions[i],
+                )
+            self._preview_done = True
+
         self.logger.info(
-            "reward raw mean | dialect=%.4f comet=%.4f cosine=%.4f | total(norm)=%.4f",
-            self.latest.raw_dialect_mean,
+            (
+                "reward raw mean | gen_density=%.4f base_density=%.4f chosen_density=%.4f "
+                "gain=%.4f comet=%.4f cosine=%.4f | total(norm)=%.4f"
+            ),
+            self.latest.raw_dialect_gen_mean,
+            self.latest.raw_dialect_base_mean,
+            self.latest.raw_dialect_chosen_mean,
+            self.latest.raw_dialect_gain_mean,
             self.latest.raw_comet_mean,
             self.latest.raw_cosine_mean,
             self.latest.total_mean,
@@ -474,20 +558,32 @@ class LoggingGRPOTrainer(GRPOTrainer):
     def log(self, logs: Dict[str, float], *args, **kwargs):
         logs = dict(logs)
 
-        # Attach latest reward component telemetry
         if self.reward_tracker is not None:
             rt = self.reward_tracker.latest
-            logs.setdefault("train/reward_raw/dialect_mean", rt.raw_dialect_mean)
+            logs.setdefault("train/reward_raw/dialect_gen_mean", rt.raw_dialect_gen_mean)
+            logs.setdefault("train/reward_raw/dialect_base_mean", rt.raw_dialect_base_mean)
+            logs.setdefault("train/reward_raw/dialect_chosen_mean", rt.raw_dialect_chosen_mean)
+            logs.setdefault("train/reward_raw/dialect_gain_mean", rt.raw_dialect_gain_mean)
+
             logs.setdefault("train/reward_raw/comet_mean", rt.raw_comet_mean)
             logs.setdefault("train/reward_raw/cosine_mean", rt.raw_cosine_mean)
-            logs.setdefault("train/reward_norm/dialect_mean", rt.norm_dialect_mean)
+
+            logs.setdefault("train/reward_norm/dialect_gain_mean", rt.norm_dialect_gain_mean)
             logs.setdefault("train/reward_norm/comet_mean", rt.norm_comet_mean)
             logs.setdefault("train/reward_norm/cosine_mean", rt.norm_cosine_mean)
+
             logs.setdefault("train/reward_total/mean", rt.total_mean)
             logs.setdefault("train/reward_total/std", rt.total_std)
 
-        # Surface KL-like keys if TRL provides them under another name
-        for src_key in ["kl", "approx_kl", "objective/kl", "train/kl", "train/approx_kl"]:
+        # Surface KL-like keys if TRL provides them
+        for src_key in [
+            "kl",
+            "approx_kl",
+            "objective/kl",
+            "train/kl",
+            "train/approx_kl",
+            "policy/approxkl_avg",
+        ]:
             if src_key in logs:
                 logs.setdefault("train/kl", logs[src_key])
 
@@ -528,8 +624,6 @@ def main() -> None:
     args = parser.parse_args()
 
     logger = setup_logging()
-
-    # Better Tensor Core utilization on A100
     torch.set_float32_matmul_precision("high")
 
     with open(args.config, "r") as f:
@@ -551,13 +645,10 @@ def main() -> None:
     model, tokenizer = load_policy_and_tokenizer(cfg, logger)
 
     dcfg = cfg["data"]
-    ds = load_dataset_from_hub_snapshot(
-        dataset_id=dcfg["dataset_id"],
-        split=dcfg.get("dataset_split", "train"),
-        logger=logger,
-    )
+    ds = load_dataset(dcfg, logger)
 
-    required_cols = ["prompt", "chosen", "rejected"]
+    base_output_column = str(dcfg.get("base_output_column", "base_output_qwen"))
+    required_cols = ["prompt", "chosen", base_output_column]
     for col in required_cols:
         if col not in ds.column_names:
             raise ValueError(f"Dataset missing required column '{col}'. Found columns: {ds.column_names}")
@@ -615,8 +706,12 @@ def main() -> None:
 
         built = build_prompt(tokenizer, system_prompt, raw, prefer_chat_template=True)
         built = truncate_prompt_to_max_tokens(tokenizer, built, max_prompt_len)
-
         ex["prompt"] = built
+
+        # Keep a trimmed base output around for fair density comparisons
+        if base_output_column in ex and isinstance(ex[base_output_column], str):
+            ex[base_output_column] = hard_trim_completion(ex[base_output_column], stop_strings)
+
         return ex
 
     train_ds = train_ds.map(map_fn)
