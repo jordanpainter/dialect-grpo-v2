@@ -2,12 +2,12 @@
   "wandb": {
     "project": "dialect-grpo-v2",
     "entity": "jordanpainter",
-     "api_key": "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"
+    "api_key": "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"
   },
 
   "model": {
-    "model_id": "srirag/sft-qwen-all",
-    "tokenizer_id": "Qwen/Qwen3-8B",
+    "model_id": "srirag/sft-llama-all",
+    "tokenizer_id": "meta-llama/Llama-3.1-8B",
 
     "load_in_4bit": false,
     "bnb_4bit_compute_dtype": "bfloat16",
@@ -29,9 +29,9 @@
   },
 
   "data": {
-    "dataset_id": "jordanpainter/dialect-grpo-base-qwen",
+    "dataset_id": "jordanpainter/dialect-grpo-base-llama",
     "dataset_split": "train",
-    "base_output_column": "base_output_qwen",
+    "base_output_column": "base_output_llama_sft",
     "seed": 42,
     "test_size": 0.02,
     "system_prompt": "You are a helpful assistant."
@@ -64,7 +64,7 @@
     "ddp_find_unused_parameters": false,
     "length_safety_margin": 16,
 
-    "output_dir": "/mnt/fast/nobackup/scratch4weeks/jp01166/runs/grpo_qwen_sft_all_v2_200",
+    "output_dir": "/mnt/fast/nobackup/scratch4weeks/jp01166/runs/grpo_llama_v2_200",
     "report_to": "wandb",
 
     "max_steps": 5000,
